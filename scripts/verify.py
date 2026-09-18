@@ -382,6 +382,289 @@ def scenario_no_group_delete_policy() -> None:
             proc.wait(timeout=10)
 
 
+def _commit_source(api: Api, stream: str, producer: str, tx_id: str,
+                   events=None) -> int:
+    api.req("POST", "/v1/producers", {"name": producer, "epoch": 1})
+    api.req("POST", "/v1/transactions",
+            {"producer": producer, "txId": tx_id, "epoch": 1})
+    events = events if events is not None else [
+        {"stream": stream, "key": "k", "payload": {"v": 1}}]
+    api.req("PUT", f"/v1/transactions/{producer}/{tx_id}/batch",
+            {"epoch": 1, "firstSequence": 1, "events": events})
+    _, committed = api.req(
+        "POST", f"/v1/transactions/{producer}/{tx_id}/commit", {"epoch": 1})
+    return committed["commitPosition"]
+
+
+def scenario_processor_crash_after_complete() -> None:
+    print("\n=== Stage 7: crash AFTER processor completion commit, BEFORE response ===")
+    main = Api(BASE_URL)
+    port = 8095
+    proc = f"dpcrash_{uuid.uuid4().hex[:10]}"
+    src, out = f"src_{uuid.uuid4().hex[:10]}", f"out_{uuid.uuid4().hex[:10]}"
+
+    worker = None
+    proc_created = False
+    try:
+        worker = Api(f"http://127.0.0.1:{port}")
+        proc_handle = start_worker(port, "crash-after-processor-complete",
+                                   "/tmp/fault7.log")
+        check("processor fault worker ready", worker.wait_ready())
+
+        # Seed a marker envelope first: the processor starts AT the marker
+        # (which is therefore already "processed"), so the source envelope is
+        # the first strictly-greater input it selects.
+        mark = f"mark_{uuid.uuid4().hex[:10]}"
+        marker_pos = _commit_source(
+            main, mark, f"pmark_{uuid.uuid4().hex[:8]}",
+            f"t_{uuid.uuid4().hex[:8]}")
+        src_pos = _commit_source(
+            main, src, f"psrc_{uuid.uuid4().hex[:8]}",
+            f"t_{uuid.uuid4().hex[:8]}")
+        sc, created = main.req("POST", "/v1/processors", {
+            "id": proc, "inputStreams": [src], "outputStreams": [out],
+            "batchSize": 10, "leaseSeconds": 600, "startPosition": marker_pos,
+        })
+        check("processor created", sc == 201, json.dumps(created))
+        proc_created = True
+
+        _, claim = worker.req("POST", f"/v1/processors/{proc}/claims", {})
+        check("source work claimed", claim["status"] == "claimed"
+              and claim["transactionCount"] == 1, json.dumps(claim))
+        result_id = f"r_{uuid.uuid4().hex[:10]}"
+        derived_events = [
+            {"stream": out, "key": "d1", "payload": {"ok": True}},
+            {"stream": out, "key": "d2", "payload": {"n": 2}},
+        ]
+        body = {
+            "resultId": result_id,
+            "leaseId": claim["leaseId"],
+            "generation": claim["generation"],
+            "sourceDigest": claim["sourceDigest"],
+            "events": derived_events,
+            "faultToken": FAULT_TOKEN,
+        }
+        crashed = False
+        try:
+            worker.req("POST", f"/v1/processors/{proc}/complete", body, raw=True)
+        except (httpx.TransportError, httpx.RemoteProtocolError):
+            crashed = True
+        check("complete request died with the process (response lost)", crashed)
+        check("fault worker actually terminated", wait_exit(proc_handle) is not None)
+        proc_handle = None
+
+        # Durable outcome must be observable from the *healthy* instance,
+        # despite the lost response: result, checkpoint and derived envelope.
+        _, stored = main.req(
+            "GET", f"/v1/processors/{proc}/results/{result_id}")
+        check("completed result durable after crash",
+              stored["status"] == "completed" and stored["eventCount"] == 2,
+              json.dumps(stored))
+        dpos = stored["commitPosition"]
+        check("derived commitPosition assigned", isinstance(dpos, int) and dpos > src_pos)
+        _, pview = main.req("GET", f"/v1/processors/{proc}")
+        check("checkpoint advanced atomically with completion",
+              pview["checkpointPosition"] == claim["throughPosition"]
+              and pview["currentWork"] is None, json.dumps(pview))
+
+        # Real restart: bring a fresh worker up and retry the EXACT same
+        # completion. It must return the original result/position and never
+        # write a second derived envelope.
+        proc_handle = start_worker(port, "", "/tmp/worker7b.log")
+        restarted = Api(f"http://127.0.0.1:{port}")
+        check("restarted worker ready", restarted.wait_ready())
+        retry_body = dict(body)
+        retry_body.pop("faultToken")
+        _, retry = restarted.req(
+            "POST", f"/v1/processors/{proc}/complete", retry_body)
+        check("completion retry returns original commitPosition",
+              retry["commitPosition"] == dpos and retry["eventCount"] == 2,
+              json.dumps(retry))
+
+        _, snap = main.req("POST", "/v1/snapshots",
+                           {"streams": [out], "ttlSeconds": 3600})
+        envelopes = snap["page"]["transactions"]
+        match = [e for e in envelopes if e["commitPosition"] == dpos]
+        check("exactly one derived envelope after crash+retry",
+              len(match) == 1 and len(match[0]["events"]) == 2,
+              f"found {len(match)}")
+        main.req("DELETE", f"/v1/snapshots/{snap['snapshotId']}")
+    finally:
+        if proc_handle is not None and proc_handle.poll() is None:
+            proc_handle.kill()
+        if proc_created:
+            main.req("DELETE", f"/v1/processors/{proc}")
+
+
+def scenario_processor_concurrency_across_instances() -> None:
+    print("\n=== Stage 8: cross-instance claim, renew, takeover, fence, retry ===")
+    main = Api(BASE_URL)
+    port_a, port_b = 8096, 8097
+    proc = f"dpconc_{uuid.uuid4().hex[:10]}"
+    src, out = f"src_{uuid.uuid4().hex[:10]}", f"out_{uuid.uuid4().hex[:10]}"
+    pa = pb = None
+    try:
+        pa = start_worker(port_a, "", "/tmp/worker8a.log")
+        pb = start_worker(port_b, "", "/tmp/worker8b.log")
+        a = Api(f"http://127.0.0.1:{port_a}", now=1_900_001_000.0)
+        b = Api(f"http://127.0.0.1:{port_b}", now=1_900_001_000.0)
+        check("instance A ready", a.wait_ready())
+        check("instance B ready", b.wait_ready())
+
+        mark = f"mark_{uuid.uuid4().hex[:10]}"
+        marker_pos = _commit_source(
+            main, mark, f"pmark_{uuid.uuid4().hex[:8]}",
+            f"t_{uuid.uuid4().hex[:8]}")
+        src_pos = _commit_source(
+            main, src, f"psrc_{uuid.uuid4().hex[:8]}",
+            f"t_{uuid.uuid4().hex[:8]}")
+        a.req("POST", "/v1/processors", {
+            "id": proc, "inputStreams": [src], "outputStreams": [out],
+            "batchSize": 10, "leaseSeconds": 30, "startPosition": marker_pos})
+
+        # Simultaneous claims against two processes: exactly one winner.
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=2) as pool:
+            ra, rb = list(pool.map(
+                lambda api: api.req("POST", f"/v1/processors/{proc}/claims", {},
+                                    raw=True), [a, b]))
+        check("concurrent cross-instance claims: exactly one winner",
+              sorted((ra.status_code, rb.status_code)) == [200, 409],
+              f"{ra.status_code}/{rb.status_code}")
+
+        winner = a if ra.status_code == 200 else b
+        loser = b if winner is a else a
+        first = ra.json() if ra.status_code == 200 else rb.json()
+        check("winning claim delivered immutable work",
+              first["status"] == "claimed"
+              and first["fromPosition"] == marker_pos
+              and first["throughPosition"] == src_pos)
+        # The loser's concurrent response was the 409 already; a follow-up
+        # claim is still rejected while the lease is live.
+        sc, err = loser.req("POST", f"/v1/processors/{proc}/claims", {},
+                            expect_error=True)
+        check("second concurrent claim is WORK_ALREADY_CLAIMED",
+              sc == 409 and err["code"] == "WORK_ALREADY_CLAIMED", f"{sc} {err}")
+
+        # Lease expires (now >= expiresAt); the other instance takes over the
+        # same range with a strictly higher generation.
+        a.now = b.now = 1_900_001_030.0
+        _, second = loser.req("POST", f"/v1/processors/{proc}/claims", {})
+        check("takeover reuses identical immutable range",
+              second["generation"] == first["generation"] + 1
+              and second["fromPosition"] == first["fromPosition"]
+              and second["throughPosition"] == first["throughPosition"]
+              and second["sourceDigest"] == first["sourceDigest"],
+              json.dumps(second))
+
+        # The stale executor is durably fenced on renew AND first completion.
+        sc, err = winner.req(
+            "POST", f"/v1/processors/{proc}/renew",
+            {"leaseId": first["leaseId"], "generation": first["generation"]},
+            expect_error=True)
+        check("old executor renew -> LEASE_FENCED",
+              sc == 409 and err["code"] == "LEASE_FENCED", f"{sc} {err}")
+        sc, err = winner.req("POST", f"/v1/processors/{proc}/complete", {
+            "resultId": f"stale_{uuid.uuid4().hex[:8]}",
+            "leaseId": first["leaseId"], "generation": first["generation"],
+            "sourceDigest": first["sourceDigest"], "events": []},
+            expect_error=True)
+        check("old executor first complete -> LEASE_FENCED",
+              sc == 409 and err["code"] == "LEASE_FENCED", f"{sc} {err}")
+
+        # New generation completes atomically with a derived envelope.
+        result_id = f"r_{uuid.uuid4().hex[:10]}"
+        _, done = loser.req("POST", f"/v1/processors/{proc}/complete", {
+            "resultId": result_id, "leaseId": second["leaseId"],
+            "generation": second["generation"],
+            "sourceDigest": second["sourceDigest"],
+            "events": [{"stream": out, "key": "d", "payload": {"v": 1}}]})
+        dpos = done["commitPosition"]
+        check("takeover completion assigns global commitPosition",
+              isinstance(dpos, int) and dpos > src_pos)
+
+        # Identical retry on the ORIGINAL instance returns the original
+        # result -- never a fence after success.
+        _, retry = winner.req("POST", f"/v1/processors/{proc}/complete", {
+            "resultId": result_id, "leaseId": second["leaseId"],
+            "generation": second["generation"],
+            "sourceDigest": second["sourceDigest"],
+            "events": [{"stream": out, "key": "d", "payload": {"v": 1}}]})
+        check("identical retry on other instance returns same position",
+              retry["commitPosition"] == dpos and retry["eventCount"] == 1,
+              json.dumps(retry))
+    finally:
+        for handle in (pa, pb):
+            if handle is not None and handle.poll() is None:
+                handle.terminate()
+                handle.wait(timeout=10)
+        try:
+            main.req("DELETE", f"/v1/processors/{proc}")
+        except AssertionError:
+            pass
+
+
+def scenario_processor_retention_interleave() -> None:
+    print("\n=== Stage 9: processor checkpoint vs retention, serializable ===")
+    main = Api(BASE_URL)
+    proc = f"dpret_{uuid.uuid4().hex[:10]}"
+    src, out = f"src_{uuid.uuid4().hex[:10]}", f"out_{uuid.uuid4().hex[:10]}"
+    group = f"g_{uuid.uuid4().hex[:10]}"
+    try:
+        mark = f"mark_{uuid.uuid4().hex[:10]}"
+        marker_pos = _commit_source(
+            main, mark, f"pmark_{uuid.uuid4().hex[:8]}",
+            f"t_{uuid.uuid4().hex[:8]}")
+        src_pos = _commit_source(
+            main, src, f"psrc_{uuid.uuid4().hex[:8]}",
+            f"t_{uuid.uuid4().hex[:8]}")
+        main.req("POST", "/v1/consumer-groups", {"name": group})
+        _, created = main.req("POST", "/v1/processors", {
+            "id": proc, "inputStreams": [src], "outputStreams": [out],
+            "batchSize": 10, "leaseSeconds": 300, "startPosition": marker_pos})
+        check("retention processor created", created["status"] == "active")
+
+        _, claim = main.req("POST", f"/v1/processors/{proc}/claims", {})
+        # Consumer group would permit deletion; the outstanding claim must not.
+        main.req("POST", f"/v1/consumer-groups/{group}/ack",
+                 {"position": src_pos + 1})
+        _, body = main.req("POST", "/v1/retention/reclaim", {})
+        check("claimed source protected from reclaim",
+              src_pos not in body["positions"], json.dumps(body["positions"]))
+
+        _, done = main.req("POST", f"/v1/processors/{proc}/complete", {
+            "resultId": f"r_{uuid.uuid4().hex[:8]}",
+            "leaseId": claim["leaseId"], "generation": claim["generation"],
+            "sourceDigest": claim["sourceDigest"],
+            "events": [{"stream": out, "key": "d", "payload": {}}]})
+        dpos = done["commitPosition"]
+
+        # Group ack covers both source and derived; the advanced checkpoint
+        # still protects the derived envelope (above the checkpoint).
+        main.req("POST", f"/v1/consumer-groups/{group}/ack",
+                 {"position": dpos + 1})
+        _, body = main.req("POST", "/v1/retention/reclaim", {})
+        check("source reclaimed after checkpoint advanced",
+              src_pos in body["positions"], json.dumps(body["positions"]))
+        check("derived envelope protected by processor checkpoint",
+              dpos not in body["positions"], json.dumps(body["positions"]))
+
+        # Deleting the processor abandons protection but never itself deletes
+        # the already committed derived envelope.
+        main.req("DELETE", f"/v1/processors/{proc}")
+        _, snap = main.req("POST", "/v1/snapshots",
+                           {"streams": [out], "ttlSeconds": 3600})
+        ids = [t["commitPosition"] for t in snap["page"]["transactions"]]
+        check("deleting processor did not delete derived envelope",
+              dpos in ids, json.dumps(ids))
+        main.req("DELETE", f"/v1/snapshots/{snap['snapshotId']}")
+    finally:
+        try:
+            main.req("DELETE", f"/v1/consumer-groups/{group}")
+        except AssertionError:
+            pass
+
+
 def main_entry() -> int:
     main = Api(BASE_URL)
     if not main.wait_ready():
@@ -394,6 +677,9 @@ def main_entry() -> int:
     scenario_cursor_across_instances()
     scenario_idle_group_expiry()
     scenario_no_group_delete_policy()
+    scenario_processor_crash_after_complete()
+    scenario_processor_concurrency_across_instances()
+    scenario_processor_retention_interleave()
 
     print("\n================ ACCEPTANCE SUMMARY ================")
     if ok_suite and not FAILURES:

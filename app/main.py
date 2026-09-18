@@ -15,13 +15,20 @@ import logging
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 import asyncpg
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from . import config, db
+from .common import (
+    ApiError,
+    body_json,
+    canonicalize_events,
+    current_time,
+    error_body,
+)
+from .processors import router as processor_router
 from .validation import (
     EPOCH_MAX,
     EPOCH_MIN,
@@ -34,65 +41,20 @@ from .validation import (
     TTL_MIN,
     ValidationError,
     canonical_json,
-    parse_json_strict,
     require_int,
     require_name,
     require_object,
     require_string_list,
-    validate_payload,
 )
 
 log = logging.getLogger("eventsvc")
 UTC = timezone.utc
 
 # Database-wide advisory lock used to give commits a global completion
-# order equal to commitPosition order, and to serialize snapshot creation
-# and retention sweeps against that order. Works across every API instance.
-COMMIT_ORDER_LOCK = 0x45564E54  # arbitrary constant
-
-
-# ---------------------------------------------------------------------------
-# Time (server UTC, deterministically injectable for tests)
-# ---------------------------------------------------------------------------
-
-
-def current_time(request: Request) -> datetime:
-    override = request.headers.get("x-now")
-    if override is not None:
-        if not config.CLOCK_OVERRIDE_TOKEN:
-            raise ApiError(400, "CLOCK_OVERRIDE_DISABLED", "clock override is not enabled")
-        supplied = request.headers.get("x-now-token", "")
-        if not hmac.compare_digest(supplied, config.CLOCK_OVERRIDE_TOKEN):
-            raise ApiError(403, "CLOCK_OVERRIDE_FORBIDDEN", "invalid clock override token")
-        try:
-            ts = float(override)
-        except ValueError as exc:
-            raise ApiError(400, "INVALID_TIME", "X-Now must be POSIX seconds") from exc
-        if not (0 <= ts <= 253402300800):
-            raise ApiError(400, "INVALID_TIME", "X-Now out of range")
-        return datetime.fromtimestamp(ts, tz=UTC)
-    return datetime.now(UTC)
-
-
-# ---------------------------------------------------------------------------
-# Error model
-# ---------------------------------------------------------------------------
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, code: str, message: str, details: dict | None = None):
-        super().__init__(message)
-        self.status = status
-        self.code = code
-        self.message = message
-        self.details = details or {}
-
-
-def error_body(code: str, message: str, details: dict | None = None) -> dict:
-    body: dict[str, Any] = {"error": {"code": code, "message": message}}
-    if details:
-        body["error"]["details"] = details
-    return body
+# order equal to commitPosition order, and to serialize snapshot creation,
+# processor claims/completions and retention sweeps against that order.
+# Defined once in db.py so every module shares the same constant.
+COMMIT_ORDER_LOCK = db.COMMIT_ORDER_LOCK  # arbitrary constant
 
 
 # ---------------------------------------------------------------------------
@@ -167,14 +129,6 @@ def out_tx(row: asyncpg.Record) -> dict:
     }
 
 
-async def body_json(request: Request) -> Any:
-    raw = await request.body()
-    try:
-        return parse_json_strict(raw)
-    except ValidationError as exc:
-        raise ApiError(400, "INVALID_JSON", exc.message)
-
-
 async def get_producer(conn: asyncpg.Connection, producer: str) -> asyncpg.Record:
     row = await conn.fetchrow("SELECT * FROM producers WHERE name = $1", producer)
     if row is None:
@@ -221,45 +175,6 @@ async def expire_idle_groups(conn: asyncpg.Connection, now: datetime) -> None:
 
 async def earliest_available(conn: asyncpg.Connection) -> int:
     return await conn.fetchval("SELECT COALESCE(MIN(commit_position), 0) FROM events")
-
-
-def canonicalize_events(events_raw: Any) -> tuple[list[dict], str, int]:
-    if not isinstance(events_raw, list) or not (
-        1 <= len(events_raw) <= config.MAX_EVENTS_PER_BATCH
-    ):
-        raise ValidationError(
-            f"events must contain 1-{config.MAX_EVENTS_PER_BATCH} items", "events"
-        )
-    events: list[dict] = []
-    total_bytes = 0
-    for i, ev in enumerate(events_raw):
-        if not isinstance(ev, dict):
-            raise ValidationError(f"events[{i}] must be an object", f"events[{i}]")
-        stream = require_name(ev.get("stream"), f"events[{i}].stream")
-        event_key = require_name(ev.get("key"), f"events[{i}].key")
-        if "payload" not in ev:
-            raise ValidationError(f"events[{i}].payload is required", f"events[{i}].payload")
-        payload_text = validate_payload(ev["payload"], f"events[{i}].payload")
-        nbytes = len(payload_text.encode("utf-8"))
-        if nbytes > config.MAX_EVENT_PAYLOAD_BYTES:
-            raise ApiError(
-                413, "BATCH_TOO_LARGE",
-                f"events[{i}].payload exceeds {config.MAX_EVENT_PAYLOAD_BYTES} bytes",
-            )
-        total_bytes += nbytes
-        if total_bytes > config.MAX_BATCH_BYTES:
-            raise ApiError(
-                413, "BATCH_TOO_LARGE",
-                f"batch exceeds {config.MAX_BATCH_BYTES} canonical bytes",
-                {"maxBatchBytes": config.MAX_BATCH_BYTES},
-            )
-        events.append({"stream": stream, "key": event_key, "payload": payload_text})
-    # Fingerprint of the *content* only; producer/txId/epoch bind the row and
-    # firstSequence is positional state.
-    fingerprint = [
-        [e["stream"], e["key"], json.loads(e["payload"])] for e in events
-    ]
-    return events, canonical_json({"events": fingerprint}), total_bytes
 
 
 async def read_page(
@@ -377,6 +292,11 @@ async def get_config() -> dict:
         "retentionNoGroupPolicy": config.RETENTION_NO_GROUP_POLICY,
         "retentionNoGroupHorizonSeconds": config.RETENTION_NO_GROUP_HORIZON_SECONDS,
         "consumerGroupIdleTtlSeconds": config.CONSUMER_GROUP_IDLE_TTL_SECONDS,
+        "processorMaxStreams": config.PROCESSOR_MAX_STREAMS,
+        "processorMaxBatchSize": config.PROCESSOR_MAX_BATCH_SIZE,
+        "processorMaxEvents": config.PROCESSOR_MAX_EVENTS,
+        "processorLeaseMinSeconds": config.PROCESSOR_LEASE_MIN_SECONDS,
+        "processorLeaseMaxSeconds": config.PROCESSOR_LEASE_MAX_SECONDS,
         "faultInjectionEnabled": bool(config.FAULT_POINTS),
     }
 
@@ -1049,6 +969,19 @@ async def reclaim(request: Request) -> JSONResponse:
                 "SELECT MAX(high_watermark) FROM snapshots"
             )  # NULL when no live snapshot
 
+            # Derived processors participate in history safety: every
+            # non-deleted processor (active OR paused) still needs every
+            # envelope strictly above its durable checkpoint, including any
+            # claimed-but-not-completed range. A NULL floor means no processor
+            # exists, so it imposes no bound. Computed while holding the
+            # commit-order lock, the same lock under which a completion
+            # advances its checkpoint and publishes the derived envelope, so
+            # the floor and derived data appear atomically to reclaim.
+            proc_floor = await conn.fetchval(
+                "SELECT MIN(checkpoint_position) FROM processors "
+                "WHERE status IN ('active','paused')"
+            )
+
             if no_group_delete:
                 # Time-based eligibility (every surviving snapshot still
                 # protects envelopes at/below its high watermark).
@@ -1059,8 +992,9 @@ async def reclaim(request: Request) -> JSONResponse:
                     "SELECT commit_position FROM transactions "
                     "WHERE status='committed' AND committed_at <= $1 "
                     "AND ($2::bigint IS NULL OR commit_position > $2) "
+                    "AND ($3::bigint IS NULL OR commit_position <= $3) "
                     "ORDER BY commit_position FOR UPDATE",
-                    horizon, snap_hw_max,
+                    horizon, snap_hw_max, proc_floor,
                 )
                 ack_floor = None
             else:
@@ -1071,8 +1005,9 @@ async def reclaim(request: Request) -> JSONResponse:
                     "SELECT commit_position FROM transactions "
                     "WHERE status='committed' AND commit_position < $1 "
                     "AND ($2::bigint IS NULL OR commit_position > $2) "
+                    "AND ($3::bigint IS NULL OR commit_position <= $3) "
                     "ORDER BY commit_position FOR UPDATE",
-                    ack_floor, snap_hw_max,
+                    ack_floor, snap_hw_max, proc_floor,
                 )
             victims = [r["commit_position"] for r in victim_rows]
 
@@ -1111,6 +1046,7 @@ async def reclaim(request: Request) -> JSONResponse:
         "positions": victims,
         "ackFloorPosition": ack_floor,
         "snapshotWatermarkCeiling": snap_hw_max,
+        "processorCheckpointFloor": proc_floor,
         "expiredSnapshotCount": len(expired_rows),
         "earliestAvailablePosition": earliest,
         "reclaimedAt": now.isoformat(),
@@ -1136,6 +1072,10 @@ async def retention_status(request: Request) -> JSONResponse:
             latest = await conn.fetchval(
                 "SELECT COALESCE(MAX(commit_position), 0) FROM events"
             )
+            proc_floor = await conn.fetchval(
+                "SELECT MIN(checkpoint_position) FROM processors "
+                "WHERE status IN ('active','paused')"
+            )
     return JSONResponse(status_code=200, content={
         "earliestAvailablePosition": earliest,
         "latestPosition": latest,
@@ -1143,6 +1083,12 @@ async def retention_status(request: Request) -> JSONResponse:
         "minAckPosition": min_ack if min_ack >= 0 else None,
         "liveSnapshotCount": snap["n"],
         "snapshotWatermarkCeiling": snap["hw_max"] if snap["n"] else None,
+        "processorCheckpointFloor": proc_floor,
         "noGroupPolicy": config.RETENTION_NO_GROUP_POLICY,
         "asOf": now.isoformat(),
     })
+
+
+# Persistent derived processor routes (defined in app/processors.py) share
+# the global error handlers; include them after the app and handlers exist.
+app.include_router(processor_router)

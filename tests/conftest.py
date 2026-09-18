@@ -126,6 +126,55 @@ class Client:
         return self.request("POST", "/v1/retention/reclaim", body,
                             expect_error=expect_error)
 
+    # -- derived processors --------------------------------------------------
+    def create_processor_dp(self, pid, input_streams, output_streams,
+                            batch_size=10, lease_seconds=60, start_position=0,
+                            expect_error=False):
+        return self.request("POST", "/v1/processors", {
+            "id": pid,
+            "inputStreams": input_streams,
+            "outputStreams": output_streams,
+            "batchSize": batch_size,
+            "leaseSeconds": lease_seconds,
+            "startPosition": start_position,
+        }, expect_error=expect_error)
+
+    def get_processor_dp(self, pid):
+        return self.request("GET", f"/v1/processors/{pid}")
+
+    def claim(self, pid, expect_error=False):
+        return self.request("POST", f"/v1/processors/{pid}/claims", {},
+                            expect_error=expect_error)
+
+    def renew(self, pid, lease_id, generation, expect_error=False):
+        return self.request("POST", f"/v1/processors/{pid}/renew",
+                            {"leaseId": lease_id, "generation": generation},
+                            expect_error=expect_error)
+
+    def complete(self, pid, result_id, lease_id, generation, source_digest,
+                 events, fault_token=None, expect_error=False):
+        body = {"resultId": result_id, "leaseId": lease_id,
+                "generation": generation, "sourceDigest": source_digest,
+                "events": events}
+        if fault_token:
+            body["faultToken"] = fault_token
+        return self.request("POST", f"/v1/processors/{pid}/complete", body,
+                            expect_error=expect_error)
+
+    def get_result_dp(self, pid, result_id, expect_error=False):
+        return self.request(
+            "GET", f"/v1/processors/{pid}/results/{result_id}",
+            expect_error=expect_error)
+
+    def pause_dp(self, pid):
+        return self.request("POST", f"/v1/processors/{pid}/pause", {})
+
+    def resume_dp(self, pid):
+        return self.request("POST", f"/v1/processors/{pid}/resume", {})
+
+    def delete_processor_dp(self, pid):
+        return self.request("DELETE", f"/v1/processors/{pid}")
+
     def read_all(self, snapshot_body):
         """Drain a snapshot from its first page to the end."""
         txs = list(snapshot_body["page"]["transactions"])
@@ -180,5 +229,14 @@ def _isolate(client: Client):
         _, groups = client.request("GET", "/v1/consumer-groups")
         for g in groups.get("consumerGroups", []):
             client.request("DELETE", f"/v1/consumer-groups/{g['name']}")
+    except AssertionError:
+        pass
+    # Derived processors must be removed so their checkpoints do not keep
+    # protecting history for unrelated retention tests. Deleting a processor
+    # abandons protection but never deletes committed derived envelopes.
+    try:
+        _, procs = client.request("GET", "/v1/processors")
+        for p in procs.get("processors", []):
+            client.request("DELETE", f"/v1/processors/{p['id']}")
     except AssertionError:
         pass

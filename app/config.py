@@ -55,10 +55,18 @@ RETENTION_NO_GROUP_HORIZON_SECONDS = _int(
 # after this many seconds of no ack activity. 0 disables idle expiry.
 CONSUMER_GROUP_IDLE_TTL_SECONDS = _int("CONSUMER_GROUP_IDLE_TTL_SECONDS", 0)
 
+# Persistent derived-processor limits
+PROCESSOR_MAX_STREAMS = _int("PROCESSOR_MAX_STREAMS", 100)
+PROCESSOR_MAX_BATCH_SIZE = _int("PROCESSOR_MAX_BATCH_SIZE", 100)
+PROCESSOR_MAX_EVENTS = _int("PROCESSOR_MAX_EVENTS", 100)
+PROCESSOR_LEASE_MIN_SECONDS = _int("PROCESSOR_LEASE_MIN_SECONDS", 1)
+PROCESSOR_LEASE_MAX_SECONDS = _int("PROCESSOR_LEASE_MAX_SECONDS", 86400)
+
 # Deterministic fault injection. MUST be off in production.
 # Accepts a comma separated list of fault points to arm:
-#   crash-after-commit  : exit hard after tx commit is durable but before HTTP response
-#   crash-during-reclaim: exit hard in the middle of a retention sweep
+#   crash-after-commit             : exit hard after tx commit is durable but before HTTP response
+#   crash-during-reclaim           : exit hard in the middle of a retention sweep
+#   crash-after-processor-complete : exit hard after derived-work completion is durable but before HTTP response
 FAULT_POINTS = {
     p.strip() for p in os.environ.get("FAULT_POINTS", "").split(",") if p.strip()
 }
