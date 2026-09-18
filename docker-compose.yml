@@ -1,0 +1,78 @@
+# The whole stack builds and runs with Docker only.
+#   docker compose up --build            starts db + api and runs the
+#                                        one-shot `verify` acceptance service
+#   docker compose run --rm verify       re-run acceptance
+# Host port of the API is controlled by API_PORT (default 8080).
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER:-eventsvc}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-eventsvc}
+      POSTGRES_DB: ${DB_NAME:-eventsvc}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-eventsvc} -d ${DB_NAME:-eventsvc}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  api:
+    build: .
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${DB_USER:-eventsvc}
+      DB_PASSWORD: ${DB_PASSWORD:-eventsvc}
+      DB_NAME: ${DB_NAME:-eventsvc}
+      # Production default: fault injection OFF.
+      FAULT_POINTS: ""
+      # Deterministic clock injection for acceptance; leave unset to disable.
+      CLOCK_OVERRIDE_TOKEN: ${CLOCK_OVERRIDE_TOKEN:-acceptance-clock}
+      MAX_EVENTS_PER_BATCH: ${MAX_EVENTS_PER_BATCH:-100}
+      MAX_BATCH_BYTES: ${MAX_BATCH_BYTES:-1048576}
+      DEFAULT_SNAPSHOT_TTL_SECONDS: ${DEFAULT_SNAPSHOT_TTL_SECONDS:-3600}
+      RETENTION_NO_GROUP_POLICY: ${RETENTION_NO_GROUP_POLICY:-reject}
+      RETENTION_NO_GROUP_HORIZON_SECONDS: ${RETENTION_NO_GROUP_HORIZON_SECONDS:-86400}
+      CONSUMER_GROUP_IDLE_TTL_SECONDS: ${CONSUMER_GROUP_IDLE_TTL_SECONDS:-0}
+    ports:
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # No curl in the slim image; use the stdlib.
+      test: ["CMD", "python", "-c",
+             "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8080/health/ready',timeout=3); sys.exit(0 if json.load(r)['database']=='up' else 1)"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+    restart: unless-stopped
+
+  # One-shot acceptance service. Runs the pytest contract suite against the
+  # real API, then the crash/restart scenarios with locally supervised,
+  # fault-injected API workers sharing the same durable database.
+  verify:
+    build: .
+    command: ["python", "scripts/verify.py"]
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${DB_USER:-eventsvc}
+      DB_PASSWORD: ${DB_PASSWORD:-eventsvc}
+      DB_NAME: ${DB_NAME:-eventsvc}
+      BASE_URL: http://api:8080
+      CLOCK_OVERRIDE_TOKEN: ${CLOCK_OVERRIDE_TOKEN:-acceptance-clock}
+      FAULT_TOKEN: ${FAULT_TOKEN:-acceptance-fault}
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  pgdata:
